@@ -21,7 +21,6 @@
 ]]
 
 local ContextActionService = game:GetService("ContextActionService")
-local GuiService = game:GetService("GuiService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -35,14 +34,17 @@ local SWING = {
 	-- Min stops tight orbits that whip the camera; max is sanity for long lines.
 	MinRopeLength = 8,
 	MaxRopeLength = 900,
-	-- Attach slightly SHORTER than the measured distance, so the rope lands
-	-- with a catch that converts falling speed into arc speed immediately...
+	-- Attach SHORTER than measured, so the catch converts fall into arc speed...
 	AttachLengthFactor = 0.88,
 	-- ...capped in absolute studs: a percentage scales with distance, and a
 	-- 70-stud rope violation on a 600-stud line is a catapult, not a catch.
 	AttachCatchMax = 10,
 	ReelSpeed = 46, -- manual reel (Shift / Ctrl)
-	AutoReelSpeed = 9, -- constant slow winch while taut; kills dead hangs
+	AutoReelSpeed = 9, -- gentle winch once you are actually swinging
+	-- RopePullAccel is only ~20% of gravity, so force alone cannot lift you off
+	-- a floor. Shortening a TAUT rope is what physically drags you to the anchor.
+	HaulReelSpeed = 60,
+	HaulUntilSpeed = 40,
 	-- ACCELERATIONS, multiplied by AssemblyMass at use: mass-independent tuning.
 	RopePullAccel = 40, -- the rope actively contracts: main height lever
 	AirControlAccel = 60, -- well under gravity: input shapes the arc, never fights it
@@ -61,7 +63,6 @@ local SWING = {
 	-- Humanoid handling.
 	GroundProbe = 3.6, -- own ray; FloorMaterial lies while in Physics state
 	GroundedGrace = 0.12, -- ignore one-frame scrapes at the bottom of an arc
-	ScrapeKeepSpeed = 26, -- skimming the street this fast is a swing, not a landing
 	AlignResponsiveness = 22,
 	AlignMaxTorque = 2e5,
 }
@@ -75,8 +76,7 @@ local ANCHOR = {
 	-- Fan biased UP, so aiming at a facade finds its high wall, not the pavement.
 	FanPitchesDeg = { 0, 12, 24, 38 },
 	FanYawsDeg = { 0, -7, 7, -14, 14 },
-	-- Aim blended toward velocity as speed rises: past ~100 studs/s momentum
-	-- matters more than the crosshair, and fighting it gives whiplash swings.
+	-- Assist blends toward velocity at speed: momentum beats crosshair past ~100.
 	VelocityBlendStartSpeed = 25,
 	VelocityBlendMaxSpeed = 100,
 	VelocityBlendMax = 0.55,
@@ -85,8 +85,7 @@ local ANCHOR = {
 	FlatNormalY = 0.72,
 	FlatRejectBelowHeight = 25,
 	FlatScorePenalty = 0.8,
-	-- Sweep budget is a fixed DISTANCE of travel, not an angle: a fixed angle on
-	-- a 600-stud line dips underground and would veto every long shot.
+	-- Sweep budget is a DISTANCE of travel, not an angle: angles veto long shots.
 	SweepRadius = 2.5,
 	SweepSamples = 6,
 	SweepArcDeg = 120,
@@ -334,6 +333,7 @@ type Grapple = typeof(setmetatable(
 		humanoid: Humanoid,
 		root: BasePart,
 		camera: Camera,
+		mouse: Mouse,
 		state: State,
 		wantsFire: boolean,
 		reelInput: number,
@@ -382,6 +382,7 @@ function Grapple.new(character: Model, camera: Camera): Grapple
 		humanoid = humanoid,
 		root = root,
 		camera = camera,
+		mouse = LocalPlayer:GetMouse(),
 		state = "Idle" :: State,
 		wantsFire = false,
 		reelInput = 0,
@@ -464,7 +465,7 @@ function Grapple._buildReticle(self: Grapple)
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "GrappleReticle"
 	gui.ResetOnSpawn = false
-	gui.IgnoreGuiInset = true
+	gui.IgnoreGuiInset = false
 	gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 	self.reticleGui = gui
 
@@ -492,10 +493,9 @@ function Grapple._aimCFrame(self: Grapple): CFrame
 	if not UserInputService.MouseEnabled then
 		return CFrame.lookAlong(origin, self.camera.CFrame.LookVector)
 	end
-	-- GetMouseLocation includes the top-bar inset; ViewportPointToRay does not.
-	local inset = GuiService:GetGuiInset()
-	local loc = UserInputService:GetMouseLocation()
-	local ray = self.camera:ViewportPointToRay(loc.X - inset.X, loc.Y - inset.Y)
+	-- UnitRay is the engine's own camera->cursor ray: no screen-vs-viewport or
+	-- GUI-inset conversion left to get wrong (hand-rolling it cost ~36px).
+	local ray = self.mouse.UnitRay
 	-- Resolve what the cursor is over, then aim from the CHARACTER at that
 	-- point: the camera sits behind the body, so its ray has parallax error.
 	local hit = Workspace:Raycast(ray.Origin, ray.Direction * ANCHOR.MaxRange, self.aimParams)
@@ -686,8 +686,11 @@ function Grapple._updateAttached(self: Grapple, dt: number)
 	local isTaut = distance > 1 and distance >= rope.Length - 0.75
 
 	if isTaut then
-		-- Constant slow winch, so a swing never decays into a dead hang.
-		rope.Length = math.max(SWING.MinRopeLength, rope.Length - SWING.AutoReelSpeed * dt)
+		-- Blend haul -> gentle winch as speed builds. A hard switch would yank
+		-- at the top of every arc, where a pendulum is momentarily slow.
+		local t = math.clamp(self.root.AssemblyLinearVelocity.Magnitude / SWING.HaulUntilSpeed, 0, 1)
+		local reel = SWING.HaulReelSpeed + (SWING.AutoReelSpeed - SWING.HaulReelSpeed) * t
+		rope.Length = math.max(SWING.MinRopeLength, rope.Length - reel * dt)
 
 		if not self.wasTaut and not self.usedCatchAssist then
 			-- Once per grapple: a pendulum re-tautens near the top of every arc,
@@ -823,10 +826,8 @@ function Grapple._updatePresentation(self: Grapple, dt: number, speed: number)
 		end
 		self.reticle.BackgroundColor3 = if self.previewValid then FEEL.ReticleValid else FEEL.ReticleInvalid
 	end
-	-- Follow the cursor: a centred dot would misreport where the hook goes.
-	-- IgnoreGuiInset puts this in GetMouseLocation's coordinate space.
-	local m = UserInputService:GetMouseLocation()
-	self.reticle.Position = UDim2.fromOffset(m.X, m.Y)
+	-- Same Mouse object the aim uses, so the dot cannot drift from the shot.
+	self.reticle.Position = UDim2.fromOffset(self.mouse.X, self.mouse.Y)
 end
 
 -- ---- MAIN UPDATE: one entry point, once per Heartbeat ----
@@ -863,12 +864,10 @@ function Grapple.update(self: Grapple, dt: number)
 	if self.state == "Attached" then
 		if not grounded and self.airborneTime > 0.02 then
 			self:_setPhysicsMode(true, false)
-		elseif self.groundedTime > SWING.GroundedGrace and self.inPhysicsMode then
-			-- Scrape guard: skimming the street at speed mid-arc is part of a
-			-- swing, not a landing.
-			if speed < SWING.ScrapeKeepSpeed or not self.wasTaut then
-				self:_setPhysicsMode(false, true)
-			end
+		elseif self.groundedTime > SWING.GroundedGrace and self.inPhysicsMode and not self.wasTaut then
+			-- Hand control back only once the rope goes SLACK: while taut we are
+			-- still grappling even on the floor, and exiting cancelled the haul.
+			self:_setPhysicsMode(false, true)
 		end
 	elseif self.inPhysicsMode then
 		self:_setPhysicsMode(false, self.groundedTime > SWING.GroundedGrace)
