@@ -9,12 +9,10 @@
 	          Hold Shift to reel in, Ctrl to reel out.
 
 	DESIGN LAW #1: THE CONSTRAINT IS THE MECHANIC.
-	The arc is never scripted. I create ONE RopeConstraint and let the solver
-	produce the pendulum; everything on top is a FORCE, because forces compose
-	with gravity and momentum instead of overwriting them. That is what makes
-	release timing real -- destroying the rope IS the release, since the
-	momentum already lives in the rigid body. The only direct velocity write is
-	a documented safety fuse in :update().
+	The arc is never scripted. ONE RopeConstraint makes the pendulum; everything
+	on top is a FORCE, so it composes with gravity and momentum instead of
+	overwriting them. Destroying the rope IS the release, because the momentum
+	already lives in the rigid body. Only direct velocity write: a safety fuse.
 
 	DESIGN LAW #2: PICKING THE ANCHOR IS HARDER THAN SWINGING ON IT.
 	One crosshair raycast picks terrible anchors constantly: too low (the
@@ -70,9 +68,9 @@ local SWING = {
 
 local ANCHOR = {
 	MaxRange = 900,
-	MinDistance = 18,
-	-- Must be this far ABOVE the character. Low anchors make pendulums that drag
-	-- you down the street -- most of the difference between good and unusable.
+	MinDistance = 12,
+	-- Assist candidates only, never the point you clicked: the assist will not
+	-- volunteer a street-level anchor, but you may deliberately aim at one.
 	MinHeightAbove = 10,
 	-- Fan biased UP, so aiming at a facade finds its high wall, not the pavement.
 	FanPitchesDeg = { 0, 12, 24, 38 },
@@ -121,12 +119,10 @@ local FEEL = {
 
 -- ANCHOR SELECTION. Free functions: pure, testable, no state between fires.
 
--- One type for both stages: `score` is filled in during scoring, so the winner
--- can be returned directly instead of copied into a second table.
+-- One type for both stages: the scored winner is returned directly, never copied.
 type Anchor = { position: Vector3, normal: Vector3, instance: BasePart, distance: number, score: number }
 
--- Flatten to the XZ plane and normalise. Swing direction is a ground-plane
--- concept; letting pitch leak into it makes scoring wobble as you look up.
+-- Flatten to XZ: swing direction is a ground-plane concept, so pitch must not leak in.
 local function flat(v: Vector3): Vector3
 	local f = Vector3.new(v.X, 0, v.Z)
 	return if f.Magnitude > 1e-4 then f.Unit else Vector3.zAxis
@@ -150,9 +146,8 @@ local function referenceDirection(camLook: Vector3, velocity: Vector3): Vector3
 	return flat(flat(camLook):Lerp(flat(velocity), t * ANCHOR.VelocityBlendMax))
 end
 
--- Sweep the circle the pendulum will travel: centred on the anchor, radius =
--- rope length, in the plane of the rope and the tangential velocity. Rejects
--- "reachable" anchors that would slam you into the building you aimed past.
+-- Sweep the circle the pendulum will travel (centred on the anchor, radius =
+-- rope length). Rejects assist anchors whose arc would slam you into a wall.
 local function arcIsClear(
 	anchorPos: Vector3,
 	rootPos: Vector3,
@@ -227,21 +222,41 @@ end
 -- skipSweep is used by the reticle preview, which must stay cheap.
 local function findAnchor(
 	rootPos: Vector3,
-	camCFrame: CFrame,
+	aimCFrame: CFrame,
 	velocity: Vector3,
 	params: RaycastParams,
 	skipSweep: boolean
 ): Anchor?
-	local camLook = camCFrame.LookVector
-	local refDir = referenceDirection(camLook, velocity)
-	-- Fire the fan from just above the character, not from the camera: the
-	-- orbit camera sits metres behind you and skews every candidate.
+	local aimLook = aimCFrame.LookVector
+	local refDir = referenceDirection(aimLook, velocity)
+	-- Fire from just above the character, not from the camera: the orbit camera
+	-- sits metres behind you and skews every candidate.
 	local origin = rootPos + Vector3.new(0, 1.5, 0)
+
+	-- STAGE 0 -- WHAT THE PLAYER POINTED AT WINS, UNCONDITIONALLY. The scored
+	-- fan below is only an assist for when you aimed at open sky. Without this
+	-- it hijacks ordinary shots: aim at a facade 70 studs off and the upward
+	-- pitches sail over it onto a tower 380 studs behind, which reads as the
+	-- hook firing through the building you picked. Casting from the CHARACTER
+	-- also guarantees line of sight, so the cable never crosses geometry.
+	local direct = Workspace:Raycast(origin, aimLook * ANCHOR.MaxRange, params)
+	if direct and direct.Instance:IsA("BasePart") then
+		local reach = (direct.Position - rootPos).Magnitude
+		if reach >= ANCHOR.MinDistance then
+			return {
+				position = direct.Position,
+				normal = direct.Normal,
+				instance = direct.Instance,
+				distance = reach,
+				score = 1,
+			}
+		end
+	end
 
 	local candidates: { Anchor } = {}
 	for _, pitchDeg in ANCHOR.FanPitchesDeg do
 		for _, yawDeg in ANCHOR.FanYawsDeg do
-			local dir = (camCFrame * CFrame.Angles(0, math.rad(yawDeg), 0) * CFrame.Angles(math.rad(pitchDeg), 0, 0)).LookVector
+			local dir = (aimCFrame * CFrame.Angles(0, math.rad(yawDeg), 0) * CFrame.Angles(math.rad(pitchDeg), 0, 0)).LookVector
 			local result = Workspace:Raycast(origin, dir * ANCHOR.MaxRange, params)
 
 			if result and result.Instance:IsA("BasePart") then
@@ -287,7 +302,7 @@ local function findAnchor(
 	end
 
 	for _, cand in candidates do
-		cand.score = scoreCandidate(cand, rootPos, camLook, refDir)
+		cand.score = scoreCandidate(cand, rootPos, aimLook, refDir)
 	end
 	table.sort(candidates, function(a, b)
 		return a.score > b.score
@@ -304,9 +319,9 @@ local function findAnchor(
 	return nil
 end
 
--- GRAPPLE: one character's hook. Metatable class (__index), so methods live
--- once on a shared table. Four states dispatched through a table, not a
--- per-frame if/elseif chain: Idle | Firing | Attached | Retracting.
+-- GRAPPLE: one character's hook. Metatable class (__index), methods shared once.
+-- Four states dispatched via table, not an if/elseif chain: Idle | Firing |
+-- Attached | Retracting.
 
 type State = "Idle" | "Firing" | "Attached" | "Retracting"
 
@@ -442,7 +457,7 @@ function Grapple._buildVisuals(self: Grapple)
 	rope.Parent = Workspace
 	self.ropePart = rope
 
-	self:_setVisualsEnabled(false)
+	self.ropePart.Transparency = 1
 end
 
 function Grapple._buildReticle(self: Grapple)
@@ -466,19 +481,12 @@ function Grapple._buildReticle(self: Grapple)
 	self.reticle = dot
 end
 
--- Toggled rather than destroyed between shots: creating parts costs far more
--- than flipping two transparencies.
-function Grapple._setVisualsEnabled(self: Grapple, on: boolean)
-	self.ropePart.Transparency = if on then 0 else 1
-end
-
 -- ---- FIRING / ATTACHING / RELEASING ----
 
--- Aim from the CURSOR, not camera.LookVector. Roblox's third-person camera
--- lets the mouse move independently, so aiming down the camera's forward
--- vector fires at screen-centre no matter where the player points. Shift-lock
--- and first-person park the cursor at the centre, so this one path covers
--- every camera mode; gamepad/touch have no cursor and fall back to camera.
+-- Aim from the CURSOR, not camera.LookVector: Roblox's third-person camera
+-- lets the mouse move independently, so the camera's forward vector fires at
+-- screen-centre wherever you point. Shift-lock parks the cursor at centre, so
+-- this covers every camera mode; gamepad/touch fall back to the camera.
 function Grapple._aimCFrame(self: Grapple): CFrame
 	local origin = self.root.Position + Vector3.new(0, 1.5, 0)
 	if not UserInputService.MouseEnabled then
@@ -488,9 +496,8 @@ function Grapple._aimCFrame(self: Grapple): CFrame
 	local inset = GuiService:GetGuiInset()
 	local loc = UserInputService:GetMouseLocation()
 	local ray = self.camera:ViewportPointToRay(loc.X - inset.X, loc.Y - inset.Y)
-	-- Resolve what the cursor is actually over, then aim the fan from the
-	-- CHARACTER at that point. Reusing the camera ray's direction alone has
-	-- parallax error, because the camera sits several studs behind the body.
+	-- Resolve what the cursor is over, then aim from the CHARACTER at that
+	-- point: the camera sits behind the body, so its ray has parallax error.
 	local hit = Workspace:Raycast(ray.Origin, ray.Direction * ANCHOR.MaxRange, self.aimParams)
 	local focus = if hit then hit.Position else ray.Origin + ray.Direction * ANCHOR.MaxRange
 	local toFocus = focus - origin
@@ -504,9 +511,8 @@ function Grapple.fire(self: Grapple)
 	if self.state ~= "Idle" then
 		return
 	end
-	-- Commit to the anchor at fire time, with the full arc sweep. The hook
-	-- then flies to a point we already proved is good, so travel time is
-	-- pure presentation and can never change the outcome.
+	-- Commit at fire time: the hook then flies to a point already proved good,
+	-- so travel time is pure presentation and cannot change the outcome.
 	local aim = self:_aimCFrame()
 	local anchor = findAnchor(self.root.Position, aim, self.root.AssemblyLinearVelocity, self.aimParams, false)
 
@@ -515,7 +521,7 @@ function Grapple.fire(self: Grapple)
 	-- Commit the target now: a miss must fly where the player aimed.
 	self.fireTarget = if anchor then anchor.position else aim.Position + aim.LookVector * ANCHOR.MaxRange
 	self.state = "Firing"
-	self:_setVisualsEnabled(true)
+	self.ropePart.Transparency = 0
 end
 
 -- Anchor in the hit part's LOCAL space, so grappling a moving object drags
@@ -549,9 +555,8 @@ function Grapple._attach(self: Grapple, anchor: Anchor)
 	self.usedCatchAssist = false
 	self.state = "Attached"
 
-	-- Fired while stood on something: the rope constrains distance but never
-	-- pulls, and the Humanoid would hold us at WalkSpeed, so nothing would
-	-- happen at all. Break ground contact and hand straight to the solver.
+	-- Fired while grounded: the rope constrains distance but never pulls, and
+	-- the Humanoid holds us at WalkSpeed. Break contact, hand to the solver.
 	if self.groundedTime > 0 then
 		local toAnchor = anchor.position - self.root.Position
 		if toAnchor.Magnitude > 1 then
@@ -587,10 +592,9 @@ function Grapple.release(self: Grapple)
 	end
 end
 
--- ---- HUMANOID MODE ----
--- The Humanoid fights swinging: it applies its own balance torque and clamps
--- horizontal speed to WalkSpeed. Physics state hands the body to the solver,
--- and this MUST be reversed exactly on release or the player cannot stand up.
+-- ---- HUMANOID MODE ---- The Humanoid fights swinging: its balance torque and
+-- WalkSpeed clamp. Physics state hands the body to the solver; reversing this
+-- exactly on release is what keeps the player able to stand up afterwards.
 
 function Grapple._setPhysicsMode(self: Grapple, on: boolean, toGround: boolean)
 	if on == self.inPhysicsMode then
@@ -654,7 +658,7 @@ function Grapple._updateRetracting(self: Grapple, dt: number)
 	local step = FEEL.HookTravelSpeed * 1.4 * dt -- returns faster than it left
 	if toMuzzle.Magnitude <= step then
 		self.state = "Idle"
-		self:_setVisualsEnabled(false)
+		self.ropePart.Transparency = 1
 		return
 	end
 	self.hookPosition += toMuzzle.Unit * step
@@ -686,9 +690,8 @@ function Grapple._updateAttached(self: Grapple, dt: number)
 		rope.Length = math.max(SWING.MinRopeLength, rope.Length - SWING.AutoReelSpeed * dt)
 
 		if not self.wasTaut and not self.usedCatchAssist then
-			-- Once per grapple: a pendulum goes slack and taut again near the
-			-- top of every arc, and without this latch the assist re-fires and
-			-- stacks impulses until the player is flung off the map.
+			-- Once per grapple: a pendulum re-tautens near the top of every arc,
+			-- and without this latch the assist stacks impulses and flings you.
 			self.usedCatchAssist = true
 			self:_catchAssist(toRoot / distance)
 		end
@@ -729,14 +732,12 @@ local STATE_HANDLERS: { [State]: (Grapple, number) -> () } = {
 	Retracting = Grapple._updateRetracting,
 }
 
--- ---- FORCES ----
--- Summed into ONE Vector3 and written once per frame; writing the property
--- repeatedly lets the solver read a half-built force and over-replicates.
+-- ---- FORCES ---- Summed into ONE Vector3, written once per frame; repeated
+-- writes let the solver read a half-built force and over-replicate.
 
 function Grapple._applyForces(self: Grapple, velocity: Vector3, speed: number)
-	-- Gate on inPhysicsMode, not merely on being airborne. Outside physics
-	-- mode the Humanoid is still driving and already applies its own air
-	-- control; adding this on top would give a plain jump double authority.
+	-- Gate on inPhysicsMode, not merely airborne: outside it the Humanoid still
+	-- drives and applies its own air control, doubling a plain jump's authority.
 	if not self.inPhysicsMode then
 		self.vectorForce.Force = Vector3.zero
 		return
@@ -782,9 +783,8 @@ end
 
 -- ---- PRESENTATION ----
 
--- Stretch one part between two points: Size.Z is the distance, and lookAt puts
--- the midpoint facing the anchor so the part's local Z aligns with the cable.
--- That is why it is a Z-long block, not a cylinder: no extra rotation needed.
+-- Size.Z is the distance and lookAt puts the midpoint facing the anchor, so the
+-- part's local Z aligns with the cable -- hence a Z-long block, not a cylinder.
 function Grapple._renderCable(self: Grapple)
 	if self.state == "Idle" then
 		return
