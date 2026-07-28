@@ -83,6 +83,13 @@ local CONFIG = {
 	SoftDragPerStud = 2.2,
 	HardMaxSpeed = 260, -- safety fuse only (see :Update)
 
+	-- Ground launch. A RopeConstraint only limits distance -- it never pulls.
+	-- So firing while stood on the floor does nothing at all: the Humanoid is
+	-- still driving, and it clamps horizontal speed to WalkSpeed. This impulse
+	-- breaks ground contact so the pendulum can actually take over.
+	GroundLaunchSpeed = 55,
+	LaunchUpBias = 0.6, -- how much of the launch is straight up vs toward the anchor
+
 	-- Catch assist: attaching from a standstill has no tangential energy, so
 	-- the player would just hang. One capped impulse buys a real first arc.
 	CatchAssistMinTangential = 32,
@@ -195,6 +202,7 @@ type Grapple = typeof(setmetatable(
 
 		-- taut bookkeeping
 		wasTaut: boolean,
+		usedCatchAssist: boolean,
 
 		-- humanoid mode
 		inPhysicsMode: boolean,
@@ -260,6 +268,7 @@ function Grapple.new(character: Model, camera: Camera): Grapple
 		rope = nil,
 
 		wasTaut = false,
+		usedCatchAssist = false,
 
 		inPhysicsMode = false,
 		groundedTime = 0,
@@ -466,7 +475,24 @@ function Grapple._attach(self: Grapple, result: RaycastResult)
 	self.rope = rope
 
 	self.wasTaut = false
+	self.usedCatchAssist = false
 	self.state = "Attached"
+
+	-- If we fired while stood on something, the rope alone cannot move us (it
+	-- constrains distance, it does not pull) and the Humanoid would keep us
+	-- pinned at WalkSpeed. Launch off the ground and hand straight over to the
+	-- solver, so the very first shot from the spawn plaza actually swings.
+	if self.groundedTime > 0 then
+		local toAnchor = result.Position - self.root.Position
+		if toAnchor.Magnitude > 1 then
+			local launch = (toAnchor.Unit + Vector3.yAxis * CONFIG.LaunchUpBias).Unit
+			self.root:ApplyImpulse(launch * (CONFIG.GroundLaunchSpeed * self.root.AssemblyMass))
+		end
+		-- Restart the grace window so the ground we are still touching this
+		-- frame cannot immediately be read as a landing and undo the launch.
+		self.groundedTime = 0
+		self:_setPhysicsMode(true, false)
+	end
 end
 
 -- Destroying the constraint is the ENTIRE release. Velocity is already in the
@@ -604,7 +630,12 @@ function Grapple._updateAttached(self: Grapple, dt: number)
 		-- Catch assist fires exactly once, on the frame the rope FIRST goes
 		-- taut, and only when there is almost no tangential energy to build on
 		-- (i.e. attaching from a standstill). Mid-chain it would feel like a shove.
-		if not self.wasTaut then
+		if not self.wasTaut and not self.usedCatchAssist then
+			-- Once per attach only. A pendulum naturally goes slack and taut
+			-- again near the top of each arc, where tangential speed is low --
+			-- without this latch the assist would re-fire every arc and stack
+			-- impulses until the player is flung off the course.
+			self.usedCatchAssist = true
 			self:_catchAssist(toRoot / distance)
 		end
 	end
