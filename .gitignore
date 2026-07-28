@@ -1,6 +1,8 @@
 globalTypes.d.luau
 sourcemap.json
 default.project.json
+CityBootstrap.server.luau
+vendor/
 *.rbxl
 *.rbxlx
 *.rbxl.lock
