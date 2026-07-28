@@ -5,41 +5,23 @@
 	Grappling hook with real pendulum swing physics, in one self-contained
 	LocalScript. Drop it in StarterPlayer > StarterPlayerScripts and it runs.
 
-	CONTROLS
-		Hold LMB / R2   Fire and hold to stay attached. Release to let go --
-		                momentum carries, so release timing is the skill.
-		Hold Shift      Reel in  (shorter rope -> you accelerate and rise)
-		Hold Ctrl       Reel out (longer rope -> you drop and widen the arc)
+	CONTROLS  Hold LMB/R2 to fire and stay attached, release to let go.
+	          Hold Shift to reel in, Ctrl to reel out.
 
-	=======================================================================
 	DESIGN LAW #1: THE CONSTRAINT IS THE MECHANIC.
-	=======================================================================
-	The arc is never scripted. I do not write a position or a velocity to
-	move the player along a curve. I create ONE RopeConstraint and let the
-	physics solver produce the pendulum. Everything layered on top is a
-	FORCE (VectorForce), because forces compose with gravity and existing
-	momentum instead of overwriting them.
+	The arc is never scripted. I create ONE RopeConstraint and let the solver
+	produce the pendulum; everything on top is a FORCE, because forces compose
+	with gravity and momentum instead of overwriting them. That is what makes
+	release timing real -- destroying the rope IS the release, since the
+	momentum already lives in the rigid body. The only direct velocity write is
+	a documented safety fuse in :update().
 
-	That is what makes release timing real: destroying the rope IS the
-	entire release, because the momentum already lives in the rigid body.
-	The only direct velocity write in this script is a documented safety
-	fuse in :update(), which is not a movement mechanic.
-
-	=======================================================================
 	DESIGN LAW #2: PICKING THE ANCHOR IS HARDER THAN SWINGING ON IT.
-	=======================================================================
-	A single crosshair raycast picks terrible anchors constantly -- too low
-	(the pendulum drags you along the street), behind you, or a swing
-	straight into a wall. So a fire is four stages, cheapest first:
-
-		1. FAN      20 rays, biased upward, spread around the aim direction
-		2. REJECT   hard filters: too low, too close, too far off-axis
-		3. SCORE    arc quality, weighted; best-first sort
-		4. SWEEP    spherecast the PREDICTED ARC of the top candidates and
-		            take the first one whose path is actually clear
-
-	Stage 4 is the expensive one, so only the best few candidates ever pay
-	for it, and the reticle preview skips it entirely (see PreviewInterval).
+	One crosshair raycast picks terrible anchors constantly: too low (the
+	pendulum drags you down the street), behind you, or a swing straight into a
+	wall. So a fire runs four stages, cheapest first -- FAN 20 upward-biased
+	rays, REJECT on height/distance/off-axis, SCORE for arc quality, then
+	SWEEP the predicted arc of the best few and take the first that is clear.
 ]]
 
 local ContextActionService = game:GetService("ContextActionService")
@@ -49,19 +31,14 @@ local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 
---[[==========================================================================
-	CONFIGURATION
-	Feel is ~90% these numbers, so they live in one place, named, and
-	commented with WHY rather than what.
-	Units: studs, seconds, studs/s, studs/s^2. Roblox gravity = 196.2.
-===========================================================================]]
+-- CONFIGURATION. Feel is ~90% these numbers, so they live in one place with
+-- the WHY, not the what. Units: studs, seconds, studs/s, studs/s^2 (gravity 196.2).
 
 local SWING = {
 	-- Rope length limits. Min stops degenerate tight orbits that whip the
 	-- camera; max is sanity for very long city lines.
 	MinRopeLength = 8,
 	MaxRopeLength = 900,
-
 	-- Attach slightly SHORTER than the measured distance, so the rope lands
 	-- with a catch that converts falling speed into arc speed immediately...
 	AttachLengthFactor = 0.88,
@@ -69,39 +46,31 @@ local SWING = {
 	-- distance, and a 70-stud instant rope violation on a 600-stud line is a
 	-- solver catapult, not a catch.
 	AttachCatchMax = 10,
-
 	ReelSpeed = 46, -- manual reel (Shift / Ctrl)
 	AutoReelSpeed = 9, -- constant slow winch while taut; kills dead hangs
-
 	-- Forces, expressed as ACCELERATIONS and multiplied by AssemblyMass at
 	-- the use site, so tuning is independent of avatar/accessory weight.
 	RopePullAccel = 40, -- the rope actively contracts: main height lever
 	AirControlAccel = 60, -- well under gravity: input shapes the arc, never fights it
 	PumpBonus = 2.6, -- input multiplier at the BOTTOM of the arc (pumping)
-
 	-- Soft speed limit: drag grows past the cap so speed approaches an
 	-- asymptote. A hard cap feels like a wall; this feels like air.
 	SoftMaxSpeed = 170,
 	SoftDragPerStud = 2.2,
 	HardMaxSpeed = 260, -- safety fuse only
-
 	-- Catch assist: attaching with no tangential energy would just leave you
 	-- hanging. One capped impulse, once per grapple, buys a real first arc.
 	CatchAssistMinTangential = 32,
 	CatchAssistMaxBoost = 26,
-
 	-- Firing from the ground: a RopeConstraint limits distance, it never
 	-- pulls. Without an impulse to break ground contact the Humanoid simply
 	-- holds you at WalkSpeed and nothing happens at all.
 	GroundLaunchSpeed = 52,
 	LaunchUpBias = 0.55,
-
 	-- Humanoid handling.
 	GroundProbe = 3.6, -- own ray; FloorMaterial lies while in Physics state
 	GroundedGrace = 0.12, -- ignore one-frame scrapes at the bottom of an arc
 	ScrapeKeepSpeed = 26, -- skimming the street this fast is a swing, not a landing
-	RunOutMaxWalk = 55, -- land fast -> sprint out of it instead of gluing
-	RunOutDecay = 24,
 	AlignResponsiveness = 22,
 	AlignMaxTorque = 2e5,
 }
@@ -113,27 +82,22 @@ local ANCHOR = {
 	-- make pendulums that drag you down the street; this single filter is
 	-- most of the difference between a good and an unusable grapple.
 	MinHeightAbove = 10,
-
 	-- Ray fan. Pitches are biased UP so aiming at a building face tends to
 	-- find its high wall rather than the pavement in front of it.
 	FanPitchesDeg = { 0, 12, 24, 38 },
 	FanYawsDeg = { 0, -7, 7, -14, 14 },
-
 	-- Reference direction = camera look blended toward velocity as speed
 	-- rises. Past ~100 studs/s momentum matters more than the crosshair;
 	-- anchors that fight momentum are how you get whiplash swings.
 	VelocityBlendStartSpeed = 25,
 	VelocityBlendMaxSpeed = 100,
 	VelocityBlendMax = 0.55,
-
 	MaxOffAxisDeg = 80, -- candidates behind the reference direction die
-
 	-- Near-flat upward surfaces (rooftops) barely above the player are
 	-- rejected; higher roofs just take a score penalty.
 	FlatNormalY = 0.72,
 	FlatRejectBelowHeight = 25,
 	FlatScorePenalty = 0.8,
-
 	-- Arc sweep. Budget is a fixed DISTANCE of upcoming travel, not a fixed
 	-- angle: a fixed angle on a 600-stud line dips deep underground and
 	-- would veto every long shot.
@@ -142,7 +106,6 @@ local ANCHOR = {
 	SweepArcDeg = 120,
 	SweepArcLength = 130,
 	MaxSweepCandidates = 8,
-
 	-- Scoring weights. Aim is the largest term: respect the crosshair, but
 	-- let a great anchor slightly off-axis beat a bad one dead-centre.
 	WeightAim = 0.40,
@@ -153,7 +116,6 @@ local ANCHOR = {
 	ElevationSigmaDeg = 24,
 	DistanceRampFull = 60, -- only twitchy short ropes are penalised
 	AimFullScoreDeg = 6,
-
 	-- The reticle preview runs the SAME finder as a real fire, so what the
 	-- dot promises is what you get. That is 20 raycasts, so it is throttled
 	-- to ~12 Hz and skips the expensive arc sweep.
@@ -164,51 +126,19 @@ local FEEL = {
 	BaseFov = 70,
 	MaxFovBoost = 20,
 	FovSpeedRange = 180,
+	FovSmoothing = 6, -- exponential decay rate of the FOV follow
 	RopeThickness = 0.16,
 	HookTravelSpeed = 700, -- fast: the hook is a projectile, not a lob
 	ReticleValid = Color3.fromRGB(120, 255, 160),
 	ReticleInvalid = Color3.fromRGB(235, 90, 90),
 }
 
---[[==========================================================================
-	SPRING -- tiny critically-damped solver (metatable class #1)
+-- ANCHOR SELECTION. Free functions, not methods: pure given their arguments,
+-- so they are trivially testable and obviously hold no state between fires.
 
-	Used for camera FOV and reticle scale. A spring rather than a Tween
-	because the target is recomputed every frame; tweens must be rebuilt to
-	retarget, a spring just absorbs the new goal. Damping = 2*sqrt(k) is the
-	critically damped case: settles as fast as possible without overshoot,
-	which is exactly what a camera wants.
-===========================================================================]]
-
-local Spring = {}
-Spring.__index = Spring
-
-type Spring = typeof(setmetatable(
-	{} :: { position: number, velocity: number, target: number, stiffness: number },
-	Spring
-))
-
-local function newSpring(value: number, stiffness: number): Spring
-	return setmetatable({ position = value, velocity = 0, target = value, stiffness = stiffness }, Spring)
-end
-
-function Spring.step(self: Spring, dt: number): number
-	local damping = 2 * math.sqrt(self.stiffness)
-	local accel = (self.target - self.position) * self.stiffness - self.velocity * damping
-	self.velocity += accel * dt
-	self.position += self.velocity * dt
-	return self.position
-end
-
---[[==========================================================================
-	ANCHOR SELECTION
-	Free functions rather than methods: they are pure given their arguments,
-	which keeps them trivially testable and makes it obvious they hold no
-	state between fires.
-===========================================================================]]
-
-type Anchor = { position: Vector3, normal: Vector3, instance: BasePart, distance: number }
-type Candidate = { position: Vector3, normal: Vector3, instance: BasePart, distance: number, score: number }
+-- One type for both stages: `score` is filled in during scoring, so the winner
+-- can be returned directly instead of copied into a second table.
+type Anchor = { position: Vector3, normal: Vector3, instance: BasePart, distance: number, score: number }
 
 -- Flatten to the XZ plane and normalise. Swing direction is a ground-plane
 -- concept; letting pitch leak into it makes scoring wobble as you look up.
@@ -280,7 +210,7 @@ local function arcIsClear(
 	return true
 end
 
-local function scoreCandidate(cand: Candidate, rootPos: Vector3, camLook: Vector3, refDir: Vector3): number
+local function scoreCandidate(cand: Anchor, rootPos: Vector3, camLook: Vector3, refDir: Vector3): number
 	local toAnchor = cand.position - rootPos
 	local dist = cand.distance
 
@@ -324,7 +254,7 @@ local function findAnchor(
 	-- orbit camera sits metres behind you and skews every candidate.
 	local origin = rootPos + Vector3.new(0, 1.5, 0)
 
-	local candidates: { Candidate } = {}
+	local candidates: { Anchor } = {}
 	for _, pitchDeg in ANCHOR.FanPitchesDeg do
 		for _, yawDeg in ANCHOR.FanYawsDeg do
 			local dir = (camCFrame * CFrame.Angles(0, math.rad(yawDeg), 0) * CFrame.Angles(math.rad(pitchDeg), 0, 0)).LookVector
@@ -384,27 +314,18 @@ local function findAnchor(
 	for i = 1, budget do
 		local cand = candidates[i]
 		if skipSweep or arcIsClear(cand.position, rootPos, velocity, refDir, params) then
-			return {
-				position = cand.position,
-				normal = cand.normal,
-				instance = cand.instance,
-				distance = cand.distance,
-			}
+			return cand
 		end
 	end
 	return nil
 end
 
---[[==========================================================================
-	GRAPPLE -- one instance owns one character's hook (metatable class #2)
-
-	State machine, one handler per state, dispatched through a table instead
-	of a per-frame if/elseif chain:
-		Idle       nothing deployed; reticle previews the shot
-		Firing     hook head in flight toward a committed anchor
-		Attached   rope exists, the solver owns the player
-		Retracting missed or released; head flying home
-===========================================================================]]
+-- GRAPPLE: one instance owns one character's hook. A metatable class using
+-- __index, so methods live once on a shared table rather than per instance.
+-- Four states, one handler each, dispatched through a table rather than a
+-- per-frame if/elseif chain:
+--   Idle = nothing deployed (reticle previews the shot) | Firing = hook in
+--   flight | Attached = rope exists, solver owns the player | Retracting.
 
 type State = "Idle" | "Firing" | "Attached" | "Retracting"
 
@@ -417,36 +338,26 @@ type Grapple = typeof(setmetatable(
 		humanoid: Humanoid,
 		root: BasePart,
 		camera: Camera,
-		baseWalkSpeed: number,
-
 		state: State,
 		wantsFire: boolean,
-		reelInput: number, -- +1 in, -1 out
-
+		reelInput: number,
 		hookPosition: Vector3,
 		pendingAnchor: Anchor?,
-
 		rootAttachment: Attachment,
 		vectorForce: VectorForce,
 		alignOrientation: AlignOrientation,
 		anchorAttachment: Attachment?,
 		rope: RopeConstraint?,
-
 		wasTaut: boolean,
 		usedCatchAssist: boolean,
 		inPhysicsMode: boolean,
 		groundedTime: number,
 		airborneTime: number,
-
 		ropePart: BasePart,
-		hookPart: BasePart,
 		reticle: Frame,
 		reticleGui: ScreenGui,
 		previewClock: number,
 		previewValid: boolean,
-		fovSpring: Spring,
-		reticleSpring: Spring,
-
 		aimParams: RaycastParams,
 		groundParams: RaycastParams,
 	},
@@ -475,36 +386,26 @@ function Grapple.new(character: Model, camera: Camera): Grapple
 		humanoid = humanoid,
 		root = root,
 		camera = camera,
-		baseWalkSpeed = humanoid.WalkSpeed,
-
 		state = "Idle" :: State,
 		wantsFire = false,
 		reelInput = 0,
-
 		hookPosition = root.Position,
 		pendingAnchor = nil,
-
 		rootAttachment = nil :: any,
 		vectorForce = nil :: any,
 		alignOrientation = nil :: any,
 		anchorAttachment = nil,
 		rope = nil,
-
 		wasTaut = false,
 		usedCatchAssist = false,
 		inPhysicsMode = false,
 		groundedTime = 0,
 		airborneTime = 0,
-
 		ropePart = nil :: any,
-		hookPart = nil :: any,
 		reticle = nil :: any,
 		reticleGui = nil :: any,
 		previewClock = 0,
 		previewValid = false,
-		fovSpring = newSpring(FEEL.BaseFov, 90),
-		reticleSpring = newSpring(1, 240),
-
 		aimParams = aimParams,
 		groundParams = groundParams,
 	}, Grapple)
@@ -560,36 +461,6 @@ function Grapple._buildVisuals(self: Grapple)
 	rope.Parent = Workspace
 	self.ropePart = rope
 
-	local hook = Instance.new("Part")
-	hook.Name = "GrappleHead"
-	hook.Anchored = true
-	hook.CanCollide = false
-	hook.CanQuery = false
-	hook.CanTouch = false
-	hook.CastShadow = false
-	hook.Material = Enum.Material.Metal
-	hook.Color = Color3.fromRGB(96, 106, 126)
-	hook.Size = Vector3.new(0.5, 0.5, 1.5)
-	hook.Parent = Workspace
-	self.hookPart = hook
-
-	-- A Trail needs two attachments to define the ribbon width.
-	local a0 = Instance.new("Attachment")
-	a0.Position = Vector3.new(0, 0.22, 0)
-	a0.Parent = hook
-	local a1 = Instance.new("Attachment")
-	a1.Position = Vector3.new(0, -0.22, 0)
-	a1.Parent = hook
-
-	local trail = Instance.new("Trail")
-	trail.Attachment0 = a0
-	trail.Attachment1 = a1
-	trail.Lifetime = 0.22
-	trail.LightEmission = 1
-	trail.Transparency = NumberSequence.new(0.25, 1)
-	trail.Color = ColorSequence.new(Color3.fromRGB(150, 205, 255))
-	trail.Parent = hook
-
 	self:_setVisualsEnabled(false)
 end
 
@@ -619,12 +490,9 @@ end
 -- than flipping two transparencies.
 function Grapple._setVisualsEnabled(self: Grapple, on: boolean)
 	self.ropePart.Transparency = if on then 0 else 1
-	self.hookPart.Transparency = if on then 0 else 1
 end
 
---[[--------------------------------------------------------------------------
-	FIRING / ATTACHING / RELEASING
-----------------------------------------------------------------------------]]
+-- ---- FIRING / ATTACHING / RELEASING ----
 
 function Grapple.fire(self: Grapple)
 	if self.state ~= "Idle" then
@@ -711,13 +579,10 @@ function Grapple.release(self: Grapple)
 	end
 end
 
---[[--------------------------------------------------------------------------
-	HUMANOID MODE
-	The Humanoid state machine fights swinging: it applies its own balance
-	torque and clamps horizontal speed to WalkSpeed. Physics state hands the
-	body to the solver, and this MUST be reversed exactly on release or the
-	player lands and cannot stand up.
-----------------------------------------------------------------------------]]
+-- ---- HUMANOID MODE ----
+-- The Humanoid fights swinging: it applies its own balance torque and clamps
+-- horizontal speed to WalkSpeed. Physics state hands the body to the solver,
+-- and this MUST be reversed exactly on release or the player cannot stand up.
 
 function Grapple._setPhysicsMode(self: Grapple, on: boolean, toGround: boolean)
 	if on == self.inPhysicsMode then
@@ -747,13 +612,6 @@ function Grapple._setPhysicsMode(self: Grapple, on: boolean, toGround: boolean)
 	if flatLook.Magnitude > 1e-3 then
 		self.root.CFrame = CFrame.lookAt(self.root.Position, self.root.Position + flatLook.Unit)
 	end
-	-- Landing run-out: carry swing speed onto the street instead of letting
-	-- the Humanoid clamp to WalkSpeed instantly. Decays in :update().
-	local v = self.root.AssemblyLinearVelocity
-	local flatSpeed = Vector3.new(v.X, 0, v.Z).Magnitude
-	if flatSpeed > self.baseWalkSpeed then
-		self.humanoid.WalkSpeed = math.min(flatSpeed, SWING.RunOutMaxWalk)
-	end
 	self.humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 end
 
@@ -761,9 +619,7 @@ function Grapple._isGrounded(self: Grapple): boolean
 	return Workspace:Raycast(self.root.Position, Vector3.new(0, -SWING.GroundProbe, 0), self.groundParams) ~= nil
 end
 
---[[--------------------------------------------------------------------------
-	PER-STATE HANDLERS
-----------------------------------------------------------------------------]]
+-- ---- PER-STATE HANDLERS ----
 
 -- Framerate independent: distance travelled is speed * dt, never a fixed step.
 function Grapple._updateFiring(self: Grapple, dt: number)
@@ -871,12 +727,9 @@ local STATE_HANDLERS: { [State]: (Grapple, number) -> () } = {
 	Retracting = Grapple._updateRetracting,
 }
 
---[[--------------------------------------------------------------------------
-	FORCES
-	Summed into ONE Vector3 and written to the VectorForce once per frame.
-	Writing the property repeatedly would let the solver read a half-built
-	force and replicates more than necessary.
-----------------------------------------------------------------------------]]
+-- ---- FORCES ----
+-- Summed into ONE Vector3 and written once per frame; writing the property
+-- repeatedly lets the solver read a half-built force and over-replicates.
 
 function Grapple._applyForces(self: Grapple, velocity: Vector3, speed: number)
 	-- Gate on inPhysicsMode, not merely on being airborne. Outside physics
@@ -925,9 +778,7 @@ function Grapple._applyForces(self: Grapple, velocity: Vector3, speed: number)
 	self.vectorForce.Force = force
 end
 
---[[--------------------------------------------------------------------------
-	PRESENTATION
-----------------------------------------------------------------------------]]
+-- ---- PRESENTATION ----
 
 -- Stretch one part between two points. Size.Z is the distance and
 -- CFrame.lookAt puts the midpoint between them facing the anchor, aligning
@@ -947,12 +798,14 @@ function Grapple._renderCable(self: Grapple)
 
 	self.ropePart.Size = Vector3.new(FEEL.RopeThickness, FEEL.RopeThickness, distance)
 	self.ropePart.CFrame = CFrame.lookAt(muzzle + delta * 0.5, self.hookPosition)
-	self.hookPart.CFrame = CFrame.lookAt(self.hookPosition, self.hookPosition + delta.Unit)
 end
 
 function Grapple._updatePresentation(self: Grapple, dt: number, speed: number)
-	self.fovSpring.target = FEEL.BaseFov + FEEL.MaxFovBoost * math.clamp(speed / FEEL.FovSpeedRange, 0, 1)
-	self.camera.FieldOfView = self.fovSpring:step(dt)
+	-- FOV opens with speed, smoothed by an exponential decay raised to dt so
+	-- the feel is identical at 30fps and 240fps. A lerp by a constant factor
+	-- is frame-rate dependent and subtly wrong.
+	local targetFov = FEEL.BaseFov + FEEL.MaxFovBoost * math.clamp(speed / FEEL.FovSpeedRange, 0, 1)
+	self.camera.FieldOfView += (targetFov - self.camera.FieldOfView) * (1 - math.exp(-FEEL.FovSmoothing * dt))
 
 	-- The preview runs the real finder, so the dot never lies -- but that is
 	-- 20 raycasts, so it is throttled and skips the arc sweep.
@@ -969,18 +822,10 @@ function Grapple._updatePresentation(self: Grapple, dt: number, speed: number)
 			) ~= nil
 		end
 		self.reticle.BackgroundColor3 = if self.previewValid then FEEL.ReticleValid else FEEL.ReticleInvalid
-		self.reticleSpring.target = if self.previewValid then 1.7 else 1
-	else
-		self.reticleSpring.target = 1
 	end
-
-	local scale = math.round(10 * self.reticleSpring:step(dt))
-	self.reticle.Size = UDim2.fromOffset(scale, scale)
 end
 
---[[--------------------------------------------------------------------------
-	MAIN UPDATE -- one entry point, once per Heartbeat
-----------------------------------------------------------------------------]]
+-- ---- MAIN UPDATE: one entry point, once per Heartbeat ----
 
 function Grapple.update(self: Grapple, dt: number)
 	if not self.root.Parent or self.humanoid.Health <= 0 then
@@ -1026,11 +871,6 @@ function Grapple.update(self: Grapple, dt: number)
 		self:_setPhysicsMode(false, self.groundedTime > SWING.GroundedGrace)
 	end
 
-	-- Landing run-out decay (see _setPhysicsMode).
-	if grounded and not self.inPhysicsMode and self.humanoid.WalkSpeed > self.baseWalkSpeed then
-		self.humanoid.WalkSpeed = math.max(self.baseWalkSpeed, self.humanoid.WalkSpeed - SWING.RunOutDecay * dt)
-	end
-
 	self:_applyForces(velocity, speed)
 
 	local align = self.alignOrientation
@@ -1061,16 +901,13 @@ function Grapple.destroy(self: Grapple)
 	self:release()
 	self.camera.FieldOfView = FEEL.BaseFov
 	self.ropePart:Destroy()
-	self.hookPart:Destroy()
 	self.reticleGui:Destroy()
 	self.alignOrientation:Destroy()
 	self.vectorForce:Destroy()
 	self.rootAttachment:Destroy()
 end
 
---[[==========================================================================
-	BOOTSTRAP -- lifecycle, input, and the single update loop
-===========================================================================]]
+-- ---- BOOTSTRAP: lifecycle, input, and the single update loop ----
 
 local active: Grapple? = nil
 
